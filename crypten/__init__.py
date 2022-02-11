@@ -12,6 +12,7 @@ import copy
 import logging
 import os
 import warnings
+import collections
 
 import crypten.common  # noqa: F401
 import crypten.communicator as comm
@@ -207,7 +208,7 @@ def _setup_prng():
     # here to generate seeds so that forked processes do not generate the same seed.
 
     # Generate next / prev seeds.
-    seed = int.from_bytes(os.urandom(8), "big") - 2 ** 63
+    seed = int.from_bytes(os.urandom(8), "big") - 2**63
     next_seed = torch.tensor(seed)
     prev_seed = torch.tensor([0], dtype=torch.long)  # populated by irecv
 
@@ -230,10 +231,10 @@ def _setup_prng():
     next_seed = next_seed.item()
 
     # Create local seed - Each party has a separate local generator
-    local_seed = int.from_bytes(os.urandom(8), "big") - 2 ** 63
+    local_seed = int.from_bytes(os.urandom(8), "big") - 2**63
 
     # Create global generator - All parties share one global generator for sync'd rng
-    global_seed = int.from_bytes(os.urandom(8), "big") - 2 ** 63
+    global_seed = int.from_bytes(os.urandom(8), "big") - 2**63
     global_seed = torch.tensor(global_seed)
     global_seed = comm.get().broadcast(global_seed, 0).item()
 
@@ -281,7 +282,50 @@ def load_from_party(
     """
 
     if encrypted:
-        raise NotImplementedError("Loading encrypted tensors is not yet supported")
+        assert isinstance(src, int), "Load failed: src argument must be an integer"
+        assert (
+            src >= 0 and src < comm.get().get_world_size()
+        ), "Load failed: src must be in [0, world_size)"
+
+        # source party
+        if comm.get().get_rank() == src:
+            assert (f is None and (preloaded is not None)) or (
+                (f is not None) and preloaded is None
+            ), "Exactly one of f and preloaded must not be None"
+
+            if f is None:
+                result = preloaded
+            if preloaded is None:
+                result = load_closure(f, **kwargs)
+            # print(result)
+            # print("checking size:",result.size())
+            if isinstance(result, dict):
+                result_zeros = result.copy()
+                for k in result:
+                    result_zeros[k] = torch.zeros(result[k].size())
+            else:
+                result_zeros = torch.zeros(result.size())
+            # print(result_zeros)
+            comm.get().broadcast_obj(result_zeros, src)
+
+        # Non-source party
+        else:
+            if model_class is not None:
+                crypten.common.serial.register_safe_class(model_class)
+
+            result = comm.get().broadcast_obj(None, src)
+            if isinstance(result, int) and result == -1:
+                raise TypeError("Unrecognized load type from src party")
+
+        if torch.is_tensor(result):
+            result = crypten.cryptensor(result, src=src)
+
+        # TODO: Encrypt modules before returning them
+        # if isinstance(result, torch.nn.Module):
+        #     result = crypten.nn.from_pytorch(result, src=src)
+
+        result.src = src
+        return result
     else:
         assert isinstance(src, int), "Load failed: src argument must be an integer"
         assert (
